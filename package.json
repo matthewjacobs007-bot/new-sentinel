@@ -1,0 +1,23 @@
+{
+  "name": "rcs-sentinel",
+  "version": "0.1.0",
+  "description": "RCS Sentinel — security & compliance posture scanner for Google Workspace and Microsoft 365",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^2.16.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "googleapis": "^144.0.0",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "pg-mem": "^3.0.14"
+  }
+}
