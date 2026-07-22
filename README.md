@@ -1,81 +1,44 @@
-# RCS Sentinel — Workspace Audit
+# Sentinel
 
-A read-only Cloud Security Posture Management (CSPM) scanner for Google Workspace,
-built to the "Workspace Audit" blueprint. A super admin signs in, Sentinel scans
-the domain's configuration, scores it against security best practice, and returns
-a fixable, exportable report — with a deep link into the Admin console for each gap.
+A read-only Google Workspace security posture platform for MSPs. Sign in a client's super admin, scan the tenant's configuration, score it against best practice, and hand back a fixable, exportable report — with a deep link into the Admin console for every gap.
 
-**Read-only, always.** No email, chat or Drive file contents are ever accessed —
-only security metadata (settings, roles, group policies, user status).
+**Read-only, always.** Sentinel only reads security metadata (settings, roles, group policies, user status). No email, chat or Drive file contents are ever accessed.
 
----
-
-## Run it
+## Run locally
 
 ```bash
 npm install
-cp .env.example .env      # fill in GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
+cp .env.example .env      # fill in the values
 npm start                 # → http://localhost:3000
-npm test                  # runs the scanner/scoring/export test suite (mocked APIs)
+npm test                  # runs the scanner + persistence test suite
 ```
 
 Node 20+.
 
+## What it scans (44 controls across 9 modules)
+
+- **User & Admin Access** — 2SV coverage & enforcement, super/delegated admin counts, admin 2SV, admin recovery, custom roles
+- **Account Hygiene** — dormant accounts, never-used accounts, password rotation, suspended cleanup
+- **Risk Center (Shadow IT)** — third-party OAuth apps with broad Drive/Gmail scopes
+- **Collaboration** — Groups public join / external members / public view / public post, OU structure, shared drives, Drive sharing defaults, link sharing, ownership transfer
+- **Calendar & Sites** — external calendar sharing, public Sites, Meet controls
+- **Endpoint & Device** — mobile enrolment, compromised devices, ChromeOS activity
+- **Email Security** — SPF, DMARC, DKIM, external forwarding, Gmail safety, confidential mode
+- **Application & API Access** — app access restrictions, Marketplace, less-secure apps
+- **Logging & Monitoring** — suspicious logins (live), audit retention, alert centre
+- **Backup & Continuity** — third-party backup, Vault retention, IR runbook
+
+Every finding carries a severity (critical/high/medium/low), a CIS tag, and a deep link into the Admin console.
+
 ## Google setup
 
 1. Google Cloud Console → new project → enable **Admin SDK API**, **Groups Settings API**, **Google Drive API**.
-2. OAuth consent screen → External → add the scopes below. These are *sensitive/
-   restricted*, so Google requires **app verification** before use outside your own
-   domain (test users work until then).
-3. Credentials → OAuth client ID → Web application →
-   redirect URI `http://localhost:3000/auth/google/callback`.
+2. OAuth consent screen → External → add scopes below. Sensitive scopes require Google verification before external use (test users work until then).
+3. Credentials → OAuth client ID → Web application → redirect URI `{BASE_URL}/auth/google/callback`.
 4. Sign in as a **super admin** when scanning.
 
-Scopes (all read-only where a readonly variant exists):
-`admin.directory.user.readonly`, `admin.directory.domain.readonly`,
-`admin.directory.rolemanagement.readonly`, `admin.directory.group.readonly`,
-`admin.directory.user.security` (needed to list a user's OAuth tokens — Shadow IT),
-`apps.groups.settings`, `admin.reports.audit.readonly`, `drive.readonly`.
+Scopes: `admin.directory.user.readonly`, `admin.directory.domain.readonly`, `admin.directory.rolemanagement.readonly`, `admin.directory.group.readonly`, `admin.directory.user.security`, `apps.groups.settings`, `admin.reports.audit.readonly`, `drive.readonly`.
 
----
+## Architecture
 
-## Blueprint → what's built
-
-| Blueprint module | Status |
-|---|---|
-| Security Posture Dashboard (compliance score, severity Critical→Low) | **Built** |
-| "Fix Setting" deep links into the Admin console per finding | **Built** |
-| "Accept Risk" (excludes a finding from the score) | **Built** |
-| Risk Center — third-party OAuth apps / Shadow IT, flag broad Drive/Gmail scopes | **Built** |
-| User & Admin Access — 2SV coverage/enforcement, super-admin count (<5), admin 2SV, custom roles | **Built** |
-| Account Hygiene — zombie accounts (>90 days) | **Built** |
-| Collaboration — public/external Google Groups; shared-drive review | **Built** (drive orphan-owner detection is basic) |
-| CIS tags on every finding + CSV export | **Built** |
-| PDF export | **Built** (browser print; a server-side PDF lib is the polish step) |
-| Score history / trend | **Built** (file-backed; see below) |
-
-## What still needs building for production
-
-These are in the blueprint but are infrastructure that needs a database and a
-scheduler standing up — they're scaffolded, not finished, and I've been explicit
-rather than pretend otherwise:
-
-- **Multi-tenant "Organization View"** — one dashboard across many client domains.
-  Needs the store swapped from the file stub (`lib/store.js`) to **PostgreSQL**.
-- **Cron engine + drift alerts** — scheduled recurring scans and an email when a
-  secure setting flips insecure. Blueprint suggests Cloud Scheduler / EventBridge.
-- **Domain-Wide Delegation via a service account** — required for headless,
-  scheduled multi-tenant scanning (the interactive OAuth login here covers a single
-  admin-driven scan). Wiring a service-account JWT with subject impersonation is
-  the change; the scan modules themselves are unchanged.
-- **Historical timeline UI** — the data is being recorded (`lib/store.js`); the
-  richer per-setting change log is the next view.
-- **NIST mapping** — CIS tags are on every finding; NIST is a second mapping table.
-
-## Tested
-
-`npm test` mocks the Admin SDK, Groups Settings and Drive APIs and drives the real
-scan logic end to end: user/admin/2SV counts, Shadow IT scope detection, public-group
-flagging, scoring, accept-risk, severity breakdown, CSV export and dashboard render —
-27 assertions. The live OAuth sign-in is the one thing that can only be verified with
-your registered Google app.
+Node + Express + PostgreSQL. Multi-tenant: each linked Workspace domain is a tenant with its own scan history and accepted-risk state. Drift detection compares consecutive scans and surfaces regressions.

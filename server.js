@@ -1,4 +1,4 @@
-// server.js — RCS Sentinel (multi-tenant Workspace Audit, PostgreSQL-backed)
+// server.js — Sentinel (multi-tenant Google Workspace posture platform, PostgreSQL-backed)
 import 'dotenv/config';
 import express from 'express';
 import session from 'express-session';
@@ -89,5 +89,5 @@ app.get('/export.csv', requireTeam, wrap(async (req, res) => {
 }));
 
 initSchema()
-  .then(() => app.listen(PORT, () => console.log(`RCS Sentinel running at ${BASE_URL}`)))
+  .then(() => app.listen(PORT, () => console.log(`Sentinel running at ${BASE_URL}`)))
   .catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
