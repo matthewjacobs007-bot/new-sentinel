@@ -50,9 +50,10 @@ app.get('/tenant/:domain', requireTeam, wrap(async (req, res) => {
   const saved = await store.latestScan(domain);
   if (!saved) return res.redirect('/');
   const t = (await store.listTenants()).find((x) => x.domain === domain);
-  const scan = { org: { name: t?.name || domain, platform: t?.platform || 'Google Workspace' }, scannedAt: saved.at, findings: saved.findings, stats: saved.stats || {} };
+  const scan = { org: { name: t?.name || domain, platform: t?.platform || 'Google Workspace' }, scannedAt: saved.at, findings: saved.findings, stats: saved.stats || {}, details: saved.details || {} };
   const drift = diffScans(await store.previousScan(domain), { findings: saved.findings, score: saved.score });
-  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift));
+  const category = String(req.query.cat || 'overview');
+  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category));
 }));
 
 app.get('/auth/google', requireTeam, (req, res) => {
