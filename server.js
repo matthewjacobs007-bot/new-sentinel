@@ -45,6 +45,17 @@ app.get('/logout', (req, res) => req.session.destroy(() => res.redirect('/login'
 
 app.get('/', requireTeam, wrap(async (_req, res) => res.send(orgViewPage(await store.listTenants(), BASE_URL))));
 
+app.get('/tenant/:domain/user/:email', requireTeam, wrap(async (req, res) => {
+  const domain = req.params.domain;
+  const saved = await store.latestScan(domain);
+  if (!saved) return res.redirect('/');
+  const t = (await store.listTenants()).find((x) => x.domain === domain);
+  const scan = { org: { name: t?.name || domain, platform: t?.platform || 'Google Workspace' }, scannedAt: saved.at, findings: saved.findings, stats: saved.stats || {}, details: saved.details || {} };
+  const drift = diffScans(await store.previousScan(domain), { findings: saved.findings, score: saved.score });
+  const category = 'user:' + encodeURIComponent(req.params.email);
+  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category));
+}));
+
 app.get('/tenant/:domain', requireTeam, wrap(async (req, res) => {
   const domain = req.params.domain;
   const saved = await store.latestScan(domain);
