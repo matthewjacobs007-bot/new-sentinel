@@ -121,6 +121,19 @@ const identityHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [],
 ok(identityHtml.includes('Fix in console'), 'dashboard has Fix in console buttons');
 ok(identityHtml.includes('Accept risk'), 'dashboard has Accept risk buttons');
 
+// ---- Overview surfaces top priority actions instead of requiring a click into every category ----
+ok(html.includes('Top priority actions'), 'overview has a top-priority-actions panel');
+ok(html.includes('open gap'), 'overview shows an open-gap count');
+
+// ---- Modules with only 'unknown' (needs-review) findings must NOT collapse as "all passing" ----
+// Application & API Access is 100% 'unknown' status in this fixture (0 measurable gaps,
+// but nothing is actually verified pass) — a naive gaps===0 check would mislabel it clean.
+const appsHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'apps');
+const appsModuleIdx = appsHtml.indexOf('data-module="Application &amp; API Access"');
+ok(appsModuleIdx > -1, 'apps category renders the Application & API Access module');
+ok(appsHtml.slice(appsModuleIdx, appsModuleIdx + 60).includes('data-allpass="0"'),
+  'a module full of unknown/review findings is not marked all-passing (' + appsHtml.slice(appsModuleIdx, appsModuleIdx + 60) + ')');
+
 // ================= Microsoft 365 scan (Graph API) =================
 const graphFixtures = {
   '/organization': { value: [{ displayName: 'RCS Group', verifiedDomains: [
