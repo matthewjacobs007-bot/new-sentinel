@@ -1,5 +1,6 @@
 import { google } from 'googleapis';
 import { scanGoogle } from './lib/googleScan.js';
+import { scanMicrosoft, isGlobalAdmin } from './lib/microsoftScan.js';
 import { scoreFindings, severityBreakdown } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { dashboardPage } from './lib/render.js';
@@ -73,6 +74,8 @@ ok(byId['g-2sv'].status === 'partial', '2SV 2/3=67% -> partial (' + byId['g-2sv'
 ok(byId['g-admin-count'].status === 'pass', '1 super admin < 5 -> pass');
 ok(byId['g-admin-2sv'].status === 'pass', 'admin has 2SV -> pass');
 ok(byId['g-custom-roles'].status === 'partial', '1 custom role -> partial review');
+ok(byId['g-user-recovery'].status === 'fail', 'only 1/3 active users have recovery info -> fail (' + byId['g-user-recovery'].detail + ')');
+ok(byId['g-suspended-admin'].status === 'pass', 'no suspended account holds admin rights -> pass');
 
 // ---- Risk Center / Shadow IT ----
 ok(byId['g-shadow-it'], 'shadow-IT finding present');
@@ -107,13 +110,74 @@ const csv = findingsToCsv(scan, new Set());
 ok(csv.split('\r\n').length === scan.findings.length + 2, 'CSV has one row per finding + header + meta');
 ok(csv.includes('CIS'), 'CSV includes CIS column');
 
-// ---- Dashboard renders with Fix + Accept controls ----
+// ---- Dashboard overview renders score + trend ----
 const html = dashboardPage(scan, new Set(), 'http://localhost:3000', [{ at: 'x', score: 40 }, { at: 'y', score: base.pct }]);
-ok(html.includes('Fix in console'), 'dashboard has Fix in console buttons');
-ok(html.includes('Accept risk'), 'dashboard has Accept risk buttons');
 ok(html.includes('Compliance score'), 'dashboard has compliance score');
 ok(html.includes('Previous scan'), 'dashboard shows score trend from history');
 ok(html.length > 4000, 'dashboard substantial (' + html.length + ' bytes)');
+
+// ---- Per-category module page renders Fix + Accept controls ----
+const identityHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'identity');
+ok(identityHtml.includes('Fix in console'), 'dashboard has Fix in console buttons');
+ok(identityHtml.includes('Accept risk'), 'dashboard has Accept risk buttons');
+
+// ================= Microsoft 365 scan (Graph API) =================
+const graphFixtures = {
+  '/organization': { value: [{ displayName: 'RCS Group', verifiedDomains: [
+    { name: 'rcs.onmicrosoft.com', isDefault: false },
+    { name: 'rcs-group.co.za', isDefault: true },
+  ] }] },
+  '/reports/authenticationMethods/userRegistrationDetails?$top=999': { value: [
+    { isMfaCapable: true }, { isMfaCapable: true }, { isMfaCapable: false },
+  ] },
+  '/identity/conditionalAccess/policies': { value: [
+    { state: 'enabled', conditions: { clientAppTypes: ['other'] }, grantControls: { builtInControls: ['block'] } },
+    { state: 'disabled' },
+  ] },
+  '/security/secureScores?$top=1': { value: [{ currentScore: 62, maxScore: 100, controlScores: [
+    { controlName: 'ipfilter', score: 4 }, { controlName: 'mfaall', score: 0 },
+  ] }] },
+  '/security/secureScoreControlProfiles?$top=999': { value: [
+    { id: 'ipfilter', maxScore: 4, title: 'Restrict sign-in by location', controlCategory: 'Identity', threats: [] },
+    { id: 'mfaall', maxScore: 10, title: 'Enable MFA', controlCategory: 'Identity', threats: ['account_breach'] },
+  ] },
+};
+const realFetch = global.fetch;
+global.fetch = async (url) => {
+  const path = String(url).replace('https://graph.microsoft.com/v1.0', '');
+  if (path === "/users/$count?$filter=userType eq 'Guest'") return { ok: true, json: async () => 1 };
+  if (path.startsWith('/users/$count')) return { ok: true, json: async () => 20 };
+  if (path in graphFixtures) return { ok: true, json: async () => graphFixtures[path] };
+  return { ok: false, status: 404, json: async () => ({}) };
+};
+
+const msScan = await scanMicrosoft('fake-token');
+global.fetch = realFetch;
+
+ok(msScan.org.platform === 'Microsoft 365', 'MS scan tags platform as Microsoft 365');
+ok(msScan.org.name === 'rcs-group.co.za', 'MS scan keys tenant by its default verified domain, not display name (' + msScan.org.name + ')');
+ok(msScan.findings.every((f) => f.module && f.severity && f.status), 'every MS finding has module/severity/status');
+ok(msScan.findings.every((f) => f.cis !== undefined), 'every MS finding has a CIS tag field (schema parity with Google findings)');
+const msById = Object.fromEntries(msScan.findings.map((f) => [f.id, f]));
+ok(msById['m-mfa-coverage'].status === 'partial', '2/3 MFA-capable -> partial (' + msById['m-mfa-coverage'].status + ')');
+ok(msById['m-ca'].status === 'pass', '1 enabled Conditional Access policy -> pass');
+ok(msById['m-legacy'].status === 'pass', 'legacy-auth block policy detected -> pass');
+ok(msById['m-ss-mfaall'].severity === 'critical', 'Secure Score control with account_breach threat -> critical severity');
+ok(msById['m-guest-users'].status === 'partial', '1/20 (5%) guest users -> partial (' + msById['m-guest-users'].detail + ')');
+ok(msScan.stats.users === 20, 'MS stats.users reuses the single /users/$count call (' + msScan.stats.users + ')');
+const msScored = scoreFindings(msScan.findings, new Set());
+ok(msScored.pct > 0 && msScored.pct < 100, 'MS findings score against the same engine as Google findings (' + msScored.pct + '%)');
+
+// isGlobalAdmin gate — mirrors the Google super-admin check
+global.fetch = async (url) => {
+  const path = String(url).replace('https://graph.microsoft.com/v1.0', '');
+  if (path.startsWith('/me/memberOf')) return { ok: true, json: async () => ({ value: [{ displayName: 'Global Administrator', roleTemplateId: '62e90394-69f5-4237-9190-012177145e10' }] }) };
+  return { ok: false, status: 404, json: async () => ({}) };
+};
+ok(await isGlobalAdmin('fake-token') === true, 'isGlobalAdmin recognises the Global Administrator role');
+global.fetch = async () => ({ ok: true, json: async () => ({ value: [{ displayName: 'Helpdesk Administrator', roleTemplateId: 'not-ga' }] }) });
+ok(await isGlobalAdmin('fake-token') === false, 'isGlobalAdmin rejects a non-Global-Admin role');
+global.fetch = realFetch;
 
 // ================= Multi-tenant: Postgres store + drift + org view =================
 import { newDb } from 'pg-mem';
@@ -164,7 +228,7 @@ ok(!(await store.acceptedFor(domain)).has('g-2sv'), 'pg: un-accept works');
 // org view render
 const org = orgViewPage(await store.listTenants(), 'http://localhost:3000');
 ok(org.includes('rcs.co.za'), 'org view: lists the tenant');
-ok(org.includes('Link tenant'), 'org view: has link-tenant action');
+ok(org.includes('Link Google Workspace') && org.includes('Link Microsoft 365'), 'org view: has link-tenant actions for both platforms');
 ok(org.includes('Client tenants') || org.includes('Tenants under management'), 'org view: header present');
 
 console.log(fail ? `\n${fail} FAILURE(S)` : '\nALL GREEN');

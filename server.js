@@ -12,17 +12,22 @@ import express from 'express';
 import session from 'express-session';
 import crypto from 'node:crypto';
 import { google } from 'googleapis';
+import { ConfidentialClientApplication } from '@azure/msal-node';
 
 import { scanGoogle } from './lib/googleScan.js';
+import { scanMicrosoft, isGlobalAdmin, getSignedInUser } from './lib/microsoftScan.js';
 import { scoreFindings } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { diffScans } from './lib/drift.js';
+import { notifyDrift } from './lib/alerts.js';
 import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage } from './lib/render.js';
 import { initSchema } from './lib/db.js';
 import * as store from './lib/store.js';
 
 const { PORT = 3000, BASE_URL = `http://localhost:${PORT}`, SESSION_SECRET = 'dev-secret',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+  MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, MICROSOFT_TENANT_ID = 'organizations',
+  ALERT_WEBHOOK_URL,
   TEAM_USER = 'rcs', TEAM_PASS = 'changeme' } = process.env;
 
 const SCOPES = [
@@ -38,6 +43,21 @@ const SCOPES = [
 ];
 
 const oauth = () => new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, `${BASE_URL}/auth/google/callback`);
+
+// ── Microsoft 365 (Entra ID) OAuth ───────────────────────────
+const MS_SCOPES = [
+  'User.Read', 'Organization.Read.All', 'User.Read.All', 'Directory.Read.All',
+  'Policy.Read.All', 'Reports.Read.All', 'SecurityEvents.Read.All',
+];
+const MS_REDIRECT_URI = `${BASE_URL}/auth/microsoft/callback`;
+const msIsConfigured = Boolean(MICROSOFT_CLIENT_ID && MICROSOFT_CLIENT_SECRET);
+const msal = () => new ConfidentialClientApplication({
+  auth: {
+    clientId: MICROSOFT_CLIENT_ID,
+    clientSecret: MICROSOFT_CLIENT_SECRET,
+    authority: `https://login.microsoftonline.com/${MICROSOFT_TENANT_ID}`,
+  },
+});
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -178,6 +198,52 @@ app.get('/auth/google/callback', wrap(async (req, res) => {
   // If MSP was already signed in, their role stays 'msp' — this was just a link operation.
 
   const drift = diffScans(prev, { findings: scan.findings, score: pct });
+  notifyDrift(ALERT_WEBHOOK_URL, domain, drift, pct); // fire-and-forget; never blocks the response
+  const roleHint = { role: isMsp(req) ? 'msp' : 'client' };
+  res.send(dashboardPage(scan, accepted, BASE_URL, await store.scanHistory(domain), drift, 'overview', roleHint));
+}));
+
+// ── Microsoft 365 (Entra ID) OAuth ───────────────────────────
+// Mirrors the Google flow above: same dual mode=msp/client, same super-admin gate
+// (Global Administrator in Entra), same scan → score → persist → dashboard pipeline.
+app.get('/auth/microsoft', (req, res) => {
+  if (!msIsConfigured) return res.status(500).send(errorPage('Microsoft 365 sign-in is not configured on this server (missing MICROSOFT_CLIENT_ID / MICROSOFT_CLIENT_SECRET).'));
+  const mode = req.query.mode === 'msp' ? 'msp' : 'client';
+  if (mode === 'msp' && !isMsp(req)) return res.redirect('/login');
+  const state = crypto.randomBytes(16).toString('hex');
+  req.session.oauth_state = state;
+  req.session.oauth_mode = mode;
+  msal().getAuthCodeUrl({ scopes: MS_SCOPES, redirectUri: MS_REDIRECT_URI, state, prompt: 'consent' })
+    .then((url) => res.redirect(url))
+    .catch((e) => res.status(500).send(errorPage(e.message)));
+});
+
+app.get('/auth/microsoft/callback', wrap(async (req, res) => {
+  if (!req.query.state || req.query.state !== req.session.oauth_state) throw new Error('State mismatch.');
+  const mode = req.session.oauth_mode || 'client';
+  const result = await msal().acquireTokenByCode({ code: req.query.code, scopes: MS_SCOPES, redirectUri: MS_REDIRECT_URI });
+  const token = result.accessToken;
+
+  // Identify the signed-in user and verify they are a tenant Global Administrator.
+  const { email: signedInEmail } = await getSignedInUser(token);
+  if (!(await isGlobalAdmin(token))) return res.redirect('/login?e=not_admin');
+
+  // Run the scan — same code path used by the MSP link flow.
+  const scan = await scanMicrosoft(token);
+  const domain = (scan.org.name || '').toLowerCase();
+  const prev = await store.latestScan(domain);
+  const accepted = await store.acceptedFor(domain);
+  const { pct } = scoreFindings(scan.findings, accepted);
+  await store.saveScan(domain, scan, pct);
+
+  if (mode === 'client') {
+    req.session.role = 'client';
+    req.session.tenant = domain;
+    req.session.user = signedInEmail;
+  }
+
+  const drift = diffScans(prev, { findings: scan.findings, score: pct });
+  notifyDrift(ALERT_WEBHOOK_URL, domain, drift, pct); // fire-and-forget; never blocks the response
   const roleHint = { role: isMsp(req) ? 'msp' : 'client' };
   res.send(dashboardPage(scan, accepted, BASE_URL, await store.scanHistory(domain), drift, 'overview', roleHint));
 }));
@@ -203,7 +269,8 @@ app.get('/export.csv', requireAuth, wrap(async (req, res) => {
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   const saved = await store.latestScan(domain);
   if (!saved) return res.redirect('/');
-  const scan = { org: { name: domain, platform: 'Google Workspace' }, scannedAt: saved.at, findings: saved.findings };
+  const t = (await store.listTenants()).find((x) => x.domain === domain);
+  const scan = { org: { name: domain, platform: t?.platform || 'Google Workspace' }, scannedAt: saved.at, findings: saved.findings };
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="sentinel-${domain}.csv"`);
   res.send(findingsToCsv(scan, await store.acceptedFor(domain)));
