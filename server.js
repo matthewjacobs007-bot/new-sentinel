@@ -309,7 +309,7 @@ app.get('/activate', requireAuth, wrap(async (req, res) => {
   // An already-active client landing here (e.g. a stale bookmark) just goes to their dashboard.
   if (tenant.active && !isMsp(req)) return res.redirect('/tenant/' + encodeURIComponent(domain));
   res.send(activatePage(tenant, BASE_URL, {
-    stripeConfigured: billing.isConfigured(),
+    paymentsConfigured: billing.isConfigured(),
     cancelled: req.query.cancelled === '1',
     isMsp: isMsp(req),
   }));
@@ -321,8 +321,9 @@ app.post('/activate/checkout', requireAuth, wrap(async (req, res) => {
   if (!billing.isConfigured()) return res.redirect('/activate?domain=' + encodeURIComponent(domain));
   const tenant = await store.getTenant(domain);
   if (!tenant) return res.redirect('/');
-  const session = await billing.createCheckoutSession({ domain, name: tenant.name, priceCents: tenant.priceCents, baseUrl: BASE_URL });
-  res.redirect(session.url);
+  const email = (req.session.user || '').includes('@') ? req.session.user : undefined;
+  const tx = await billing.startCheckout({ domain, name: tenant.name, email, priceCents: tenant.priceCents, baseUrl: BASE_URL });
+  res.redirect(tx.authorization_url);
 }));
 
 app.get('/activate/success', requireAuth, wrap(async (req, res) => {
@@ -331,14 +332,14 @@ app.get('/activate/success', requireAuth, wrap(async (req, res) => {
   let tenant = await store.getTenant(domain);
   if (!tenant) return res.redirect('/');
   // The webhook below is the source of truth; this is an immediate-feedback fallback
-  // that also covers local dev, where Stripe's webhook can't reach localhost.
-  if (!tenant.active && req.query.session_id && billing.isConfigured()) {
+  // that also covers local dev, where Paystack's webhook can't reach localhost.
+  if (!tenant.active && req.query.reference && billing.isConfigured()) {
     try {
-      const session = await billing.retrieveSession(req.query.session_id);
-      if (session.payment_status === 'paid' || session.status === 'complete') {
+      const tx = await billing.verifyTransaction(req.query.reference);
+      if (tx.status === 'success') {
         await store.activateTenant(domain, {
-          stripeCustomerId: session.customer,
-          stripeSubscriptionId: session.subscription?.id || session.subscription,
+          paymentCustomerId: tx.customer?.customer_code,
+          paymentSubscriptionId: tx.plan_object?.plan_code || tx.plan,
         });
         tenant = await store.getTenant(domain);
       }
@@ -354,22 +355,22 @@ app.post('/activate/manual', requireMsp, wrap(async (req, res) => {
   res.redirect('/tenant/' + encodeURIComponent(domain));
 }));
 
-// Stripe's source of truth for activation. Needs the RAW body for signature
+// Paystack's source of truth for activation. Needs the RAW body for signature
 // verification, so this route gets its own body parser (urlencoded above only
 // engages for form content-types and leaves this stream untouched).
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), wrap(async (req, res) => {
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret || !billing.isConfigured()) return res.status(400).send('Stripe webhook is not configured.');
-  let event;
-  try {
-    event = billing.constructWebhookEvent(req.body, req.headers['stripe-signature'], secret);
-  } catch (e) {
-    return res.status(400).send(`Webhook signature verification failed: ${e.message}`);
-  }
-  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
-    const session = event.data.object;
-    const domain = session.metadata?.domain;
-    if (domain) await store.activateTenant(domain, { stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription });
+app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), wrap(async (req, res) => {
+  if (!billing.isConfigured()) return res.status(400).send('Paystack webhook is not configured.');
+  const valid = await billing.verifyWebhookSignature(req.body, req.headers['x-paystack-signature']);
+  if (!valid) return res.status(400).send('Webhook signature verification failed.');
+  const event = JSON.parse(req.body.toString('utf8'));
+  if (event.event === 'charge.success') {
+    const domain = event.data?.metadata?.domain;
+    if (domain) {
+      await store.activateTenant(domain, {
+        paymentCustomerId: event.data.customer?.customer_code,
+        paymentSubscriptionId: event.data.plan_object?.plan_code || event.data.plan,
+      });
+    }
   }
   res.json({ received: true });
 }));

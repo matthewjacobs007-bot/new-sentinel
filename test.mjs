@@ -259,29 +259,29 @@ ok(t0.active === false, 'pg: a freshly-scanned tenant starts inactive (unpaid)')
 ok(t0.userCount === scan.stats.users, 'pg: tenant records the scanned user count (' + t0.userCount + ')');
 ok(t0.priceCents === 10000, 'pg: 4 users -> $100 floor price recorded (' + t0.priceCents + ')');
 
-await store.activateTenant(domain, { stripeCustomerId: 'cus_test123', stripeSubscriptionId: 'sub_test456' });
+await store.activateTenant(domain, { paymentCustomerId: 'CUS_test123', paymentSubscriptionId: 'PLN_test456' });
 const t1 = await store.getTenant(domain);
 ok(t1.active === true, 'pg: activateTenant marks the tenant active');
-ok(t1.stripeCustomerId === 'cus_test123', 'pg: stripe customer id persisted');
+ok(t1.paymentCustomerId === 'CUS_test123', 'pg: payment customer id persisted');
 
 // Re-scanning must NOT reset billing status back to unpaid.
 await store.saveScan(domain, { org: s1.org, scannedAt: '2026-07-20T00:00:00.000Z', findings: scan.findings, stats: scan.stats }, score1);
 ok((await store.getTenant(domain)).active === true, 'pg: re-scanning an active tenant leaves it active');
 
 // activateTenant is idempotent / safe to call twice (webhook + success-page fallback race)
-await store.activateTenant(domain, { stripeCustomerId: 'cus_test123' });
+await store.activateTenant(domain, { paymentCustomerId: 'CUS_test123' });
 ok((await store.getTenant(domain)).active === true, 'pg: activateTenant is idempotent');
 
 // ---- activate / activateSuccess page render ----
 const { activatePage, activateSuccessPage } = await import('./lib/render.js');
 const unpaidTenant = { domain: 'new-client.co.za', name: 'new-client.co.za', userCount: 60, priceCents: 10000, active: false };
-const wallHtml = activatePage(unpaidTenant, 'http://localhost:3000', { stripeConfigured: false });
+const wallHtml = activatePage(unpaidTenant, 'http://localhost:3000', { paymentsConfigured: false });
 ok(wallHtml.includes('$100.00'), 'activate page shows the computed monthly price');
-ok(wallHtml.includes("contact us") , 'activate page falls back to contact-us when Stripe is not configured');
-ok(!wallHtml.includes('action="http://localhost:3000/activate/checkout"'), 'activate page hides the Stripe form when not configured');
+ok(wallHtml.includes("contact us") , 'activate page falls back to contact-us when payments are not configured');
+ok(!wallHtml.includes('action="http://localhost:3000/activate/checkout"'), 'activate page hides the payment form when not configured');
 
-const wallHtmlConfigured = activatePage(unpaidTenant, 'http://localhost:3000', { stripeConfigured: true });
-ok(wallHtmlConfigured.includes('action="http://localhost:3000/activate/checkout"'), 'activate page shows the Stripe checkout form when configured');
+const wallHtmlConfigured = activatePage(unpaidTenant, 'http://localhost:3000', { paymentsConfigured: true });
+ok(wallHtmlConfigured.includes('action="http://localhost:3000/activate/checkout"'), 'activate page shows the Paystack checkout form when configured');
 
 const successHtml = activateSuccessPage({ domain: 'new-client.co.za', name: 'new-client.co.za' }, 'http://localhost:3000', true);
 ok(successHtml.includes("You're all set") && successHtml.includes('/tenant/new-client.co.za'), 'activate-success page links to the dashboard once activated');
