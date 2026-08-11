@@ -20,7 +20,7 @@ import { scoreFindings } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { diffScans } from './lib/drift.js';
 import { notifyDrift } from './lib/alerts.js';
-import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage } from './lib/render.js';
+import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage, marketingPage, leadsPage } from './lib/render.js';
 import { initSchema } from './lib/db.js';
 import * as store from './lib/store.js';
 
@@ -102,14 +102,31 @@ app.post('/login', (req, res) => {
 
 app.get('/logout', (req, res) => req.session.destroy(() => res.redirect('/login')));
 
-// ── Landing / index (differs by role) ───────────────────────
-app.get('/', requireAuth, wrap(async (req, res) => {
+// ── Landing / index (public marketing page, or the app if signed in) ───
+app.get('/', wrap(async (req, res) => {
+  if (!isAuthed(req)) {
+    // Anonymous visitor: the public lead-gen site, not a login redirect.
+    return res.send(marketingPage(BASE_URL, { sent: req.query.sent === '1' }));
+  }
   if (isMsp(req)) {
     // MSP: full org view.
     return res.send(orgViewPage(await store.listTenants(), BASE_URL));
   }
   // Client: straight into their tenant.
   return res.redirect('/tenant/' + encodeURIComponent(req.session.tenant));
+}));
+
+// ── Contact / lead capture (public) ─────────────────────────
+app.post('/contact', wrap(async (req, res) => {
+  const { name, email, company, platform, message } = req.body;
+  if (!name || !email) return res.redirect('/#contact');
+  await store.saveLead({ name, email, company, platform, message });
+  res.redirect('/?sent=1#contact');
+}));
+
+// ── Leads inbox (MSP-only) ──────────────────────────────────
+app.get('/leads', requireMsp, wrap(async (req, res) => {
+  res.send(leadsPage(await store.listLeads(), BASE_URL));
 }));
 
 // ── Tenant dashboard ────────────────────────────────────────

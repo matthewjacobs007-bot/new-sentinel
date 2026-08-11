@@ -243,6 +243,39 @@ const org = orgViewPage(await store.listTenants(), 'http://localhost:3000');
 ok(org.includes('rcs.co.za'), 'org view: lists the tenant');
 ok(org.includes('Link Google Workspace') && org.includes('Link Microsoft 365'), 'org view: has link-tenant actions for both platforms');
 ok(org.includes('Client tenants') || org.includes('Tenants under management'), 'org view: header present');
+ok(org.includes(`${'http://localhost:3000'}/leads`), 'org view: links to the leads inbox');
+
+// ================= Marketing page + contact-form leads =================
+const { marketingPage, leadsPage } = await import('./lib/render.js');
+
+const marketing = marketingPage('http://localhost:3000');
+ok(marketing.includes('action="http://localhost:3000/contact"'), 'marketing page posts to /contact');
+ok(marketing.includes('Get started') && marketing.includes('Client sign in'), 'marketing page has both CTAs');
+ok(!marketing.includes("Thanks — we've got it"), 'marketing page shows the form, not the thank-you, by default');
+ok(MODULE_BLURBS_COUNT(marketing) === 10, 'marketing page lists all 10 control modules');
+
+const thanked = marketingPage('http://localhost:3000', { sent: true });
+ok(thanked.includes("Thanks — we've got it"), 'marketing page shows thank-you after a submission (?sent=1)');
+ok(!thanked.includes('<form'), 'marketing page hides the form once submitted');
+
+// leads round-trip through the same pg-mem store used above
+ok((await store.listLeads()).length === 0, 'pg: no leads yet');
+await store.saveLead({ name: 'Jane <script>', email: 'jane@acme.co.za', company: 'Acme', platform: 'Google Workspace', message: 'We have 40 users, interested.' });
+const leads = await store.listLeads();
+ok(leads.length === 1, 'pg: lead saved');
+ok(leads[0].email === 'jane@acme.co.za', 'pg: lead email persisted');
+
+const leadsHtml = leadsPage(leads, 'http://localhost:3000');
+ok(leadsHtml.includes('Jane &lt;script&gt;'), 'leads page escapes untrusted input');
+ok(leadsHtml.includes('acme.co.za'), 'leads page lists the captured lead');
+ok(leadsPage([], 'http://localhost:3000').includes('No leads yet'), 'leads page has an empty state');
+
+function MODULE_BLURBS_COUNT(html) {
+  // crude check: count how many of the known module names appear (HTML-escaped, since '&' -> '&amp;')
+  const names = ['User &amp; Admin Access', 'Account Hygiene', 'Risk Center (Shadow IT)', 'Collaboration',
+    'Calendar &amp; Sites', 'Endpoint &amp; Device', 'Email Security', 'Application &amp; API Access', 'Logging &amp; Monitoring', 'Backup &amp; Continuity'];
+  return names.filter((n) => html.includes(n)).length;
+}
 
 console.log(fail ? `\n${fail} FAILURE(S)` : '\nALL GREEN');
 process.exit(fail ? 1 : 0);
