@@ -4,9 +4,23 @@ import { scanMicrosoft, isGlobalAdmin } from './lib/microsoftScan.js';
 import { scoreFindings, severityBreakdown } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { dashboardPage } from './lib/render.js';
+import { computeMonthlyPriceCents, priceBreakdown, formatUsd } from './lib/pricing.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log((c ? 'PASS' : 'FAIL') + '  ' + m); if (!c) fail++; };
+
+// ================= Pricing: $0.50/user/month, $100/month floor =================
+ok(computeMonthlyPriceCents(0) === 10000, '0 users -> $100 floor');
+ok(computeMonthlyPriceCents(100) === 10000, '100 users × $0.50 = $50 -> still floored to $100');
+ok(computeMonthlyPriceCents(200) === 10000, '200 users × $0.50 = $100 -> exactly at the floor');
+ok(computeMonthlyPriceCents(201) === 10050, '201 users × $0.50 = $100.50 -> floor no longer applies');
+ok(computeMonthlyPriceCents(1000) === 50000, '1000 users × $0.50 = $500');
+ok(formatUsd(10000) === '$100.00', 'formatUsd renders cents as dollars');
+const bdFloor = priceBreakdown(50);
+ok(bdFloor.minimumApplied === true && bdFloor.priceCents === 10000, 'priceBreakdown flags when the floor kicks in');
+ok(bdFloor.summary.includes('minimum applies'), 'priceBreakdown summary explains the floor (' + bdFloor.summary + ')');
+const bdOverFloor = priceBreakdown(500);
+ok(bdOverFloor.minimumApplied === false && bdOverFloor.priceCents === 25000, 'priceBreakdown: 500 users -> $250, no floor message');
 
 // ---- Mock the Admin SDK / group settings / drive ----
 google.admin = ({ version }) => {
@@ -237,6 +251,42 @@ await store.acceptRisk(domain, 'g-2sv'); // idempotent (ON CONFLICT DO NOTHING)
 ok((await store.acceptedFor(domain)).size === 1, 'pg: accept-risk is idempotent');
 await store.unacceptRisk(domain, 'g-2sv');
 ok(!(await store.acceptedFor(domain)).has('g-2sv'), 'pg: un-accept works');
+
+// ================= Billing: activation gate =================
+// s1 (saved earlier via saveScan) had 4 users -> $100 floor. New tenant defaults unpaid.
+const t0 = await store.getTenant(domain);
+ok(t0.active === false, 'pg: a freshly-scanned tenant starts inactive (unpaid)');
+ok(t0.userCount === scan.stats.users, 'pg: tenant records the scanned user count (' + t0.userCount + ')');
+ok(t0.priceCents === 10000, 'pg: 4 users -> $100 floor price recorded (' + t0.priceCents + ')');
+
+await store.activateTenant(domain, { stripeCustomerId: 'cus_test123', stripeSubscriptionId: 'sub_test456' });
+const t1 = await store.getTenant(domain);
+ok(t1.active === true, 'pg: activateTenant marks the tenant active');
+ok(t1.stripeCustomerId === 'cus_test123', 'pg: stripe customer id persisted');
+
+// Re-scanning must NOT reset billing status back to unpaid.
+await store.saveScan(domain, { org: s1.org, scannedAt: '2026-07-20T00:00:00.000Z', findings: scan.findings, stats: scan.stats }, score1);
+ok((await store.getTenant(domain)).active === true, 'pg: re-scanning an active tenant leaves it active');
+
+// activateTenant is idempotent / safe to call twice (webhook + success-page fallback race)
+await store.activateTenant(domain, { stripeCustomerId: 'cus_test123' });
+ok((await store.getTenant(domain)).active === true, 'pg: activateTenant is idempotent');
+
+// ---- activate / activateSuccess page render ----
+const { activatePage, activateSuccessPage } = await import('./lib/render.js');
+const unpaidTenant = { domain: 'new-client.co.za', name: 'new-client.co.za', userCount: 60, priceCents: 10000, active: false };
+const wallHtml = activatePage(unpaidTenant, 'http://localhost:3000', { stripeConfigured: false });
+ok(wallHtml.includes('$100.00'), 'activate page shows the computed monthly price');
+ok(wallHtml.includes("contact us") , 'activate page falls back to contact-us when Stripe is not configured');
+ok(!wallHtml.includes('action="http://localhost:3000/activate/checkout"'), 'activate page hides the Stripe form when not configured');
+
+const wallHtmlConfigured = activatePage(unpaidTenant, 'http://localhost:3000', { stripeConfigured: true });
+ok(wallHtmlConfigured.includes('action="http://localhost:3000/activate/checkout"'), 'activate page shows the Stripe checkout form when configured');
+
+const successHtml = activateSuccessPage({ domain: 'new-client.co.za', name: 'new-client.co.za' }, 'http://localhost:3000', true);
+ok(successHtml.includes("You're all set") && successHtml.includes('/tenant/new-client.co.za'), 'activate-success page links to the dashboard once activated');
+const processingHtml = activateSuccessPage({ domain: 'new-client.co.za' }, 'http://localhost:3000', false);
+ok(processingHtml.includes('processing'), 'activate-success page shows a processing state before activation lands');
 
 // org view render
 const org = orgViewPage(await store.listTenants(), 'http://localhost:3000');

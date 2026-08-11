@@ -20,9 +20,10 @@ import { scoreFindings } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { diffScans } from './lib/drift.js';
 import { notifyDrift } from './lib/alerts.js';
-import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage, marketingPage, leadsPage } from './lib/render.js';
+import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage, marketingPage, leadsPage, activatePage, activateSuccessPage } from './lib/render.js';
 import { initSchema } from './lib/db.js';
 import * as store from './lib/store.js';
+import * as billing from './lib/billing.js';
 
 const { PORT = 3000, BASE_URL = `http://localhost:${PORT}`, SESSION_SECRET = 'dev-secret',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
@@ -80,6 +81,15 @@ const canSeeTenant = (req, domain) => isMsp(req) || (isClient(req) && req.sessio
 
 const wrap = (fn) => (req, res) => fn(req, res).catch((e) => res.status(500).send(errorPage(e.message)));
 
+// A client's tenant must be paid & active before they see the dashboard. MSPs are
+// never gated — this is a client-only billing check, not an access-control one.
+const requireActive = (req, res, next) => {
+  if (!isClient(req)) return next();
+  store.getTenant(req.session.tenant)
+    .then((t) => ((t && t.active) ? next() : res.redirect('/activate')))
+    .catch((e) => res.status(500).send(errorPage(e.message)));
+};
+
 // ── Login page (dual: MSP team OR client Google) ────────────
 app.get('/login', (req, res) => {
   if (isAuthed(req)) return res.redirect('/');
@@ -130,7 +140,7 @@ app.get('/leads', requireMsp, wrap(async (req, res) => {
 }));
 
 // ── Tenant dashboard ────────────────────────────────────────
-app.get('/tenant/:domain', requireAuth, wrap(async (req, res) => {
+app.get('/tenant/:domain', requireAuth, requireActive, wrap(async (req, res) => {
   const domain = req.params.domain;
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   const saved = await store.latestScan(domain);
@@ -143,7 +153,7 @@ app.get('/tenant/:domain', requireAuth, wrap(async (req, res) => {
   res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category, { role: isMsp(req) ? 'msp' : 'client' }));
 }));
 
-app.get('/tenant/:domain/user/:email', requireAuth, wrap(async (req, res) => {
+app.get('/tenant/:domain/user/:email', requireAuth, requireActive, wrap(async (req, res) => {
   const domain = req.params.domain;
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   const saved = await store.latestScan(domain);
@@ -216,6 +226,11 @@ app.get('/auth/google/callback', wrap(async (req, res) => {
 
   const drift = diffScans(prev, { findings: scan.findings, score: pct });
   notifyDrift(ALERT_WEBHOOK_URL, domain, drift, pct); // fire-and-forget; never blocks the response
+
+  // Client tenants must be paid & active before seeing the dashboard — a first-time
+  // sign-in lands on the payment wall; an already-active client re-scanning does not.
+  if (mode === 'client' && !(await store.getTenant(domain))?.active) return res.redirect('/activate');
+
   const roleHint = { role: isMsp(req) ? 'msp' : 'client' };
   res.send(dashboardPage(scan, accepted, BASE_URL, await store.scanHistory(domain), drift, 'overview', roleHint));
 }));
@@ -261,27 +276,106 @@ app.get('/auth/microsoft/callback', wrap(async (req, res) => {
 
   const drift = diffScans(prev, { findings: scan.findings, score: pct });
   notifyDrift(ALERT_WEBHOOK_URL, domain, drift, pct); // fire-and-forget; never blocks the response
+
+  // Client tenants must be paid & active before seeing the dashboard — a first-time
+  // sign-in lands on the payment wall; an already-active client re-scanning does not.
+  if (mode === 'client' && !(await store.getTenant(domain))?.active) return res.redirect('/activate');
+
   const roleHint = { role: isMsp(req) ? 'msp' : 'client' };
   res.send(dashboardPage(scan, accepted, BASE_URL, await store.scanHistory(domain), drift, 'overview', roleHint));
 }));
 
 // ── Accept / un-accept risk (both roles can, but only on their own tenant) ──
 const back = (req, res) => res.redirect('/tenant/' + encodeURIComponent(req.query.tenant || ''));
-app.get('/accept', requireAuth, wrap(async (req, res) => {
+app.get('/accept', requireAuth, requireActive, wrap(async (req, res) => {
   const domain = (req.query.tenant || '').toLowerCase();
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   if (req.query.id) await store.acceptRisk(domain, req.query.id);
   back(req, res);
 }));
-app.get('/unaccept', requireAuth, wrap(async (req, res) => {
+app.get('/unaccept', requireAuth, requireActive, wrap(async (req, res) => {
   const domain = (req.query.tenant || '').toLowerCase();
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   if (req.query.id) await store.unacceptRisk(domain, req.query.id);
   back(req, res);
 }));
 
+// ── Billing / activation (client payment wall after first scan) ─────
+app.get('/activate', requireAuth, wrap(async (req, res) => {
+  const domain = isMsp(req) ? (req.query.domain || '').toLowerCase() : req.session.tenant;
+  if (!domain) return res.redirect('/');
+  const tenant = await store.getTenant(domain);
+  if (!tenant) return res.redirect('/');
+  // An already-active client landing here (e.g. a stale bookmark) just goes to their dashboard.
+  if (tenant.active && !isMsp(req)) return res.redirect('/tenant/' + encodeURIComponent(domain));
+  res.send(activatePage(tenant, BASE_URL, {
+    stripeConfigured: billing.isConfigured(),
+    cancelled: req.query.cancelled === '1',
+    isMsp: isMsp(req),
+  }));
+}));
+
+app.post('/activate/checkout', requireAuth, wrap(async (req, res) => {
+  const domain = (isMsp(req) ? req.body.domain : req.session.tenant || '').toLowerCase();
+  if (!domain || !canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
+  if (!billing.isConfigured()) return res.redirect('/activate?domain=' + encodeURIComponent(domain));
+  const tenant = await store.getTenant(domain);
+  if (!tenant) return res.redirect('/');
+  const session = await billing.createCheckoutSession({ domain, name: tenant.name, priceCents: tenant.priceCents, baseUrl: BASE_URL });
+  res.redirect(session.url);
+}));
+
+app.get('/activate/success', requireAuth, wrap(async (req, res) => {
+  const domain = (req.query.domain || '').toLowerCase();
+  if (!domain || !canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
+  let tenant = await store.getTenant(domain);
+  if (!tenant) return res.redirect('/');
+  // The webhook below is the source of truth; this is an immediate-feedback fallback
+  // that also covers local dev, where Stripe's webhook can't reach localhost.
+  if (!tenant.active && req.query.session_id && billing.isConfigured()) {
+    try {
+      const session = await billing.retrieveSession(req.query.session_id);
+      if (session.payment_status === 'paid' || session.status === 'complete') {
+        await store.activateTenant(domain, {
+          stripeCustomerId: session.customer,
+          stripeSubscriptionId: session.subscription?.id || session.subscription,
+        });
+        tenant = await store.getTenant(domain);
+      }
+    } catch { /* fall through to the "processing" state */ }
+  }
+  res.send(activateSuccessPage(tenant, BASE_URL, tenant.active));
+}));
+
+// MSP-only override — activate a tenant without a real charge (demos, manual invoicing).
+app.post('/activate/manual', requireMsp, wrap(async (req, res) => {
+  const domain = (req.body.domain || '').toLowerCase();
+  if (domain) await store.activateTenant(domain, {});
+  res.redirect('/tenant/' + encodeURIComponent(domain));
+}));
+
+// Stripe's source of truth for activation. Needs the RAW body for signature
+// verification, so this route gets its own body parser (urlencoded above only
+// engages for form content-types and leaves this stream untouched).
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), wrap(async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret || !billing.isConfigured()) return res.status(400).send('Stripe webhook is not configured.');
+  let event;
+  try {
+    event = billing.constructWebhookEvent(req.body, req.headers['stripe-signature'], secret);
+  } catch (e) {
+    return res.status(400).send(`Webhook signature verification failed: ${e.message}`);
+  }
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+    const session = event.data.object;
+    const domain = session.metadata?.domain;
+    if (domain) await store.activateTenant(domain, { stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription });
+  }
+  res.json({ received: true });
+}));
+
 // ── CSV export ──────────────────────────────────────────────
-app.get('/export.csv', requireAuth, wrap(async (req, res) => {
+app.get('/export.csv', requireAuth, requireActive, wrap(async (req, res) => {
   const domain = (req.query.tenant || '').toLowerCase();
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   const saved = await store.latestScan(domain);
