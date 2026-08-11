@@ -5,6 +5,7 @@ import { scoreFindings, severityBreakdown } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { dashboardPage } from './lib/render.js';
 import { computeMonthlyPriceCents, priceBreakdown, formatUsd } from './lib/pricing.js';
+import { usdRate, usdCentsTo } from './lib/fx.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log((c ? 'PASS' : 'FAIL') + '  ' + m); if (!c) fail++; };
@@ -21,6 +22,16 @@ ok(bdFloor.minimumApplied === true && bdFloor.priceCents === 10000, 'priceBreakd
 ok(bdFloor.summary.includes('minimum applies'), 'priceBreakdown summary explains the floor (' + bdFloor.summary + ')');
 const bdOverFloor = priceBreakdown(500);
 ok(bdOverFloor.minimumApplied === false && bdOverFloor.priceCents === 25000, 'priceBreakdown: 500 users -> $250, no floor message');
+
+// ================= FX: USD -> billing-currency conversion =================
+ok(await usdRate('USD') === 1, 'usdRate: USD is always 1:1 with itself');
+ok(await usdCentsTo(10000, 'USD') === 10000, 'usdCentsTo: no conversion when billing currency is USD');
+// Live rate lookup (ZAR) — sanity-bounded rather than exact, since real FX rates move.
+// (Same "hit a real external service in tests" pattern already used for DNS lookups above.)
+const zarRate = await usdRate('ZAR');
+ok(typeof zarRate === 'number' && zarRate > 5 && zarRate < 50, 'usdRate: USD->ZAR is a plausible rate (' + zarRate + ')');
+const zarAmount = await usdCentsTo(10000, 'ZAR');
+ok(zarAmount === Math.round(10000 * zarRate), 'usdCentsTo: $100.00 converts to the expected ZAR cents (' + zarAmount + ')');
 
 // ---- Mock the Admin SDK / group settings / drive ----
 google.admin = ({ version }) => {

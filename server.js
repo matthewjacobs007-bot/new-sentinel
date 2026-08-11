@@ -312,6 +312,7 @@ app.get('/activate', requireAuth, wrap(async (req, res) => {
     paymentsConfigured: billing.isConfigured(),
     cancelled: req.query.cancelled === '1',
     isMsp: isMsp(req),
+    billingCurrency: process.env.PAYSTACK_CURRENCY || 'USD',
   }));
 }));
 
