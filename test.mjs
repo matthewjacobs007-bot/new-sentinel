@@ -6,6 +6,7 @@ import { findingsToCsv } from './lib/exportCsv.js';
 import { dashboardPage } from './lib/render.js';
 import { computeMonthlyPriceCents, priceBreakdown, formatUsd } from './lib/pricing.js';
 import { usdRate, usdCentsTo } from './lib/fx.js';
+import { FRAMEWORKS, frameworksFor, scoreByFramework } from './lib/frameworks.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log((c ? 'PASS' : 'FAIL') + '  ' + m); if (!c) fail++; };
@@ -134,6 +135,28 @@ ok((sevAfter.critical + sevAfter.high) < critHigh, 'accepted crit/high drop out 
 const csv = findingsToCsv(scan, new Set());
 ok(csv.split('\r\n').length === scan.findings.length + 2, 'CSV has one row per finding + header + meta');
 ok(csv.includes('CIS'), 'CSV includes CIS column');
+ok(['SOC 2', 'ISO 27001', 'GDPR', 'POPIA'].every((h) => csv.includes(h)), 'CSV includes the new compliance framework columns');
+
+// ================= Compliance frameworks =================
+ok(['soc2', 'iso27001', 'gdpr', 'popia'].every((k) => FRAMEWORKS[k]), 'FRAMEWORKS registers all 4 new frameworks');
+ok(frameworksFor('g-2sv').soc2 === 'CC6.1', 'g-2sv maps to SOC 2 CC6.1 (MFA/logical access)');
+ok(frameworksFor('g-suspicious-logins').gdpr === 'Art. 33', 'monitoring control maps to GDPR Art. 33 (breach notification)');
+ok(frameworksFor('g-suspicious-logins').popia === 's22', 'monitoring control maps to POPIA s22 (security compromise notification)');
+ok(frameworksFor('m-mfa-coverage').soc2 === 'CC6.1', 'Microsoft MFA control is mapped too, not just Google');
+ok(frameworksFor('g-spf-example.com').iso27001 === 'A.8.24', 'dynamic per-domain SPF id still resolves via prefix match');
+ok(frameworksFor('g-drive-ownership-transfer').gdpr === null, 'a control with no real framework fit stays null, not force-mapped');
+
+const byFramework = scoreByFramework(scan.findings, new Set());
+ok(byFramework.soc2.total > 0 && byFramework.soc2.pct !== null, 'SOC 2 scores against this scan\'s mapped controls (' + byFramework.soc2.pct + '%)');
+ok(typeof byFramework.cis.pct === 'number', 'existing CIS scoring still works via scoreByFramework (' + byFramework.cis.pct + '%)');
+const totalAcrossFrameworks = Object.values(byFramework).reduce((s, fw) => s + fw.total, 0);
+ok(totalAcrossFrameworks > scan.findings.length, 'a finding can count toward multiple frameworks at once');
+
+const complianceHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'compliance');
+ok(complianceHtml.includes('Compliance frameworks'), 'compliance page has the right title');
+ok(complianceHtml.includes('SOC 2 Trust Criteria') && complianceHtml.includes('ISO/IEC 27001:2022')
+  && complianceHtml.includes('EU GDPR') && complianceHtml.includes('POPIA (South Africa)'), 'compliance page shows all 4 new framework cards');
+ok(complianceHtml.includes('not a certification'), 'compliance page discloses this is a best-effort mapping, not certification');
 
 // ---- Dashboard overview renders score + trend ----
 const html = dashboardPage(scan, new Set(), 'http://localhost:3000', [{ at: 'x', score: 40 }, { at: 'y', score: base.pct }]);
