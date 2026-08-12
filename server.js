@@ -24,6 +24,7 @@ import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage, market
 import { initSchema } from './lib/db.js';
 import * as store from './lib/store.js';
 import * as billing from './lib/billing.js';
+import * as mail from './lib/mail.js';
 
 const { PORT = 3000, BASE_URL = `http://localhost:${PORT}`, SESSION_SECRET = 'dev-secret',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
@@ -179,6 +180,7 @@ app.post('/contact', requireCsrf, wrap(async (req, res) => {
   const { name, email, company, platform, message } = req.body;
   if (!name || !email) return res.redirect('/#contact');
   await store.saveLead({ name, email, company, platform, message });
+  mail.notifyNewLead({ name, email, company, platform, message }); // fire-and-forget
   res.redirect('/?sent=1#contact');
 }));
 
@@ -422,10 +424,18 @@ app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), wrap(a
   if (event.event === 'charge.success') {
     const domain = event.data?.metadata?.domain;
     if (domain) {
+      const before = await store.getTenant(domain);
       await store.activateTenant(domain, {
         paymentCustomerId: event.data.customer?.customer_code,
         paymentSubscriptionId: event.data.plan_object?.plan_code || event.data.plan,
       });
+      // Only email on the actual unpaid->active transition — this webhook and the
+      // /activate/success fallback can both fire for the same payment, and
+      // activateTenant is intentionally idempotent, so gate on prior state here
+      // rather than risk sending the welcome email twice.
+      if (before && !before.active && event.data.customer?.email) {
+        mail.sendActivationEmail(await store.getTenant(domain), event.data.customer.email); // fire-and-forget
+      }
     }
   } else if (event.event === 'subscription.create') {
     // The real subscription_code + email_token (needed to ever cancel) only exist on
@@ -468,6 +478,7 @@ app.post('/subscription/cancel', requireAuth, requireCsrf, wrap(async (req, res)
     return res.status(502).send(errorPage(`Paystack couldn't cancel this subscription (${e.message}). Please contact us and we'll sort it out.`, { title: 'Cancellation failed' }));
   }
   await store.deactivateTenant(domain);
+  mail.notifyCancellation(tenant); // fire-and-forget
   res.redirect(isMsp(req) ? '/' : '/activate');
 }));
 

@@ -6,6 +6,7 @@ import { findingsToCsv } from './lib/exportCsv.js';
 import { dashboardPage, errorPage, privacyPage, termsPage, marketingPage } from './lib/render.js';
 import { computeMonthlyPriceCents, priceBreakdown, formatUsd } from './lib/pricing.js';
 import { usdRate, usdCentsTo } from './lib/fx.js';
+import * as mail from './lib/mail.js';
 import { FRAMEWORKS, frameworksFor, scoreByFramework } from './lib/frameworks.js';
 
 let fail = 0;
@@ -434,6 +435,19 @@ const leadsHtml = leadsPage(leads, 'http://localhost:3000');
 ok(leadsHtml.includes('Jane &lt;script&gt;'), 'leads page escapes untrusted input');
 ok(leadsHtml.includes('acme.co.za'), 'leads page lists the captured lead');
 ok(leadsPage([], 'http://localhost:3000').includes('No leads yet'), 'leads page has an empty state');
+
+// ================= Mail: graceful no-op when unconfigured =================
+delete process.env.SMTP_HOST; delete process.env.SMTP_USER; delete process.env.SMTP_PASS; delete process.env.ADMIN_EMAIL;
+ok(mail.isConfigured() === false, 'mail.isConfigured() is false with no SMTP env vars set');
+// None of these should throw or attempt a network connection when unconfigured.
+await mail.sendMail({ to: 'someone@example.com', subject: 'x', html: '<p>x</p>' });
+await mail.notifyNewLead({ name: 'Jane', email: 'jane@example.com' });
+await mail.sendActivationEmail({ domain: 'x.co.za' }, 'jane@example.com');
+await mail.notifyCancellation({ domain: 'x.co.za' });
+ok(true, 'mail functions no-op safely (no throw, no hang) when SMTP is not configured');
+process.env.SMTP_HOST = 'smtp.example.com'; process.env.SMTP_USER = 'user'; process.env.SMTP_PASS = 'pass';
+ok(mail.isConfigured() === true, 'mail.isConfigured() becomes true once SMTP_HOST/USER/PASS are all set');
+delete process.env.SMTP_HOST; delete process.env.SMTP_USER; delete process.env.SMTP_PASS;
 
 function MODULE_BLURBS_COUNT(html) {
   // crude check: count how many of the known module names appear (HTML-escaped, since '&' -> '&amp;')
