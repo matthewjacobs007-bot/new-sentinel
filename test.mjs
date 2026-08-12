@@ -146,6 +146,23 @@ const identityHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [],
 ok(identityHtml.includes('Fix in console'), 'dashboard has Fix in console buttons');
 ok(identityHtml.includes('Accept risk'), 'dashboard has Accept risk buttons');
 
+// ---- Role hint: MSP re-scanning must never fall through to client mode ----
+// (Regression: a Re-scan click without ?mode=msp defaults to mode=client on the
+// server, which both demotes the MSP's session AND routes them into the payment
+// wall meant only for clients.)
+const mspHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'overview', { role: 'msp' });
+ok(mspHtml.includes('/auth/google?mode=msp">Re-scan'), 'MSP dashboard: Re-scan link preserves mode=msp');
+ok(mspHtml.includes('All tenants'), 'MSP dashboard: shows the back-to-all-tenants link');
+
+const clientHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'overview', { role: 'client' });
+ok(clientHtml.includes('/auth/google">Re-scan'), 'client dashboard: Re-scan link has no mode param (defaults to client)');
+ok(!clientHtml.includes('All tenants'), 'client dashboard: hides the all-tenants link (no org-view access)');
+
+// Calling without a roleHint at all (older call sites) must default safely to client,
+// not accidentally expose the MSP-only "All tenants" link.
+const noHintHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'overview');
+ok(!noHintHtml.includes('All tenants'), 'dashboard with no roleHint defaults to client (safe default)');
+
 // ---- Overview surfaces top priority actions instead of requiring a click into every category ----
 ok(html.includes('Top priority actions'), 'overview has a top-priority-actions panel');
 ok(html.includes('open gap'), 'overview shows an open-gap count');
