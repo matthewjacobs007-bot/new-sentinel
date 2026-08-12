@@ -20,7 +20,7 @@ import { scoreFindings } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
 import { diffScans } from './lib/drift.js';
 import { notifyDrift } from './lib/alerts.js';
-import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage, marketingPage, leadsPage, activatePage, activateSuccessPage } from './lib/render.js';
+import { loginPage, dashboardPage, errorPage, teamLoginPage, orgViewPage, marketingPage, leadsPage, activatePage, activateSuccessPage, privacyPage, termsPage } from './lib/render.js';
 import { initSchema } from './lib/db.js';
 import * as store from './lib/store.js';
 import * as billing from './lib/billing.js';
@@ -186,6 +186,10 @@ app.post('/contact', requireCsrf, wrap(async (req, res) => {
 app.get('/leads', requireMsp, wrap(async (req, res) => {
   res.send(leadsPage(await store.listLeads(), BASE_URL));
 }));
+
+// ── Legal (public) ───────────────────────────────────────────
+app.get('/privacy', (req, res) => res.send(privacyPage(BASE_URL)));
+app.get('/terms', (req, res) => res.send(termsPage(BASE_URL)));
 
 // ── Tenant dashboard ────────────────────────────────────────
 app.get('/tenant/:domain', requireAuth, requireActive, wrap(async (req, res) => {

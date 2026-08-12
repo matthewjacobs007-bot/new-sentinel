@@ -3,7 +3,7 @@ import { scanGoogle } from './lib/googleScan.js';
 import { scanMicrosoft, isGlobalAdmin } from './lib/microsoftScan.js';
 import { scoreFindings, severityBreakdown } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
-import { dashboardPage, errorPage } from './lib/render.js';
+import { dashboardPage, errorPage, privacyPage, termsPage, marketingPage } from './lib/render.js';
 import { computeMonthlyPriceCents, priceBreakdown, formatUsd } from './lib/pricing.js';
 import { usdRate, usdCentsTo } from './lib/fx.js';
 import { FRAMEWORKS, frameworksFor, scoreByFramework } from './lib/frameworks.js';
@@ -184,6 +184,20 @@ ok(genericErr.includes('Something went wrong'), 'errorPage defaults to a neutral
 ok(!genericErr.includes('Google API scope'), 'errorPage does not default to the scan-specific hint');
 const scanErr = errorPage('Boom', { title: 'Scan could not complete', hint: "Usually a Google API scope wasn't consented." });
 ok(scanErr.includes('Scan could not complete') && scanErr.includes('Google API scope'), 'errorPage still supports the scan-specific copy when explicitly requested');
+
+// ---- Legal pages ----
+const privacy = privacyPage('http://localhost:3000');
+ok(privacy.includes('Privacy Policy'), 'privacy page has the right title');
+ok(privacy.includes('Paystack') && privacy.includes('Google') && privacy.includes('POPIA'), 'privacy page names real sub-processors and the relevant law');
+ok(privacy.includes('never request or access the contents of email'), 'privacy page states the read-only guarantee explicitly');
+
+const terms = termsPage('http://localhost:3000');
+ok(terms.includes('Terms of Service'), 'terms page has the right title');
+ok(terms.includes('not a certification of compliance'), 'terms page explicitly disclaims compliance certification, matching the in-app compliance page copy');
+ok(terms.includes('$0.50 per user per month') && terms.includes('$100/month minimum'), 'terms page states the actual pricing');
+
+const marketingWithLegal = marketingPage('http://localhost:3000');
+ok(marketingWithLegal.includes('href="http://localhost:3000/privacy"') && marketingWithLegal.includes('href="http://localhost:3000/terms"'), 'marketing page footer links to both legal pages');
 
 // ---- Role hint: MSP re-scanning must never fall through to client mode ----
 // (Regression: a Re-scan click without ?mode=msp defaults to mode=client on the
@@ -397,7 +411,7 @@ ok(org.includes('Client tenants') || org.includes('Tenants under management'), '
 ok(org.includes(`${'http://localhost:3000'}/leads`), 'org view: links to the leads inbox');
 
 // ================= Marketing page + contact-form leads =================
-const { marketingPage, leadsPage } = await import('./lib/render.js');
+const { leadsPage } = await import('./lib/render.js');
 
 const marketing = marketingPage('http://localhost:3000');
 ok(marketing.includes('action="http://localhost:3000/contact"'), 'marketing page posts to /contact');
