@@ -3,7 +3,7 @@ import { scanGoogle } from './lib/googleScan.js';
 import { scanMicrosoft, isGlobalAdmin } from './lib/microsoftScan.js';
 import { scoreFindings, severityBreakdown } from './lib/scoring2.js';
 import { findingsToCsv } from './lib/exportCsv.js';
-import { dashboardPage } from './lib/render.js';
+import { dashboardPage, errorPage } from './lib/render.js';
 import { computeMonthlyPriceCents, priceBreakdown, formatUsd } from './lib/pricing.js';
 import { usdRate, usdCentsTo } from './lib/fx.js';
 import { FRAMEWORKS, frameworksFor, scoreByFramework } from './lib/frameworks.js';
@@ -169,6 +169,22 @@ const identityHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [],
 ok(identityHtml.includes('Fix in console'), 'dashboard has Fix in console buttons');
 ok(identityHtml.includes('Accept risk'), 'dashboard has Accept risk buttons');
 
+// ---- CSRF: accept/un-accept are POST forms carrying the session-bound token ----
+const csrfHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'identity', { role: 'client' }, 'test-csrf-token-123');
+ok(csrfHtml.includes('<form method="post" action="http://localhost:3000/accept"'), 'accept is a POST form, not a GET link');
+ok(csrfHtml.includes('name="_csrf" value="test-csrf-token-123"'), 'accept form carries the session CSRF token');
+const noCsrfHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'identity');
+ok(noCsrfHtml.includes('name="_csrf" value=""'), 'omitting csrfToken defaults safely to an empty (rejected) value, not undefined');
+
+// ---- errorPage: neutral by default, not always "Scan could not complete" ----
+// (Regression: this page renders for CSRF failures, 403s, billing errors, etc. —
+// a hardcoded scan-specific title/hint was actively misleading for those.)
+const genericErr = errorPage('You do not have access to this tenant.');
+ok(genericErr.includes('Something went wrong'), 'errorPage defaults to a neutral title');
+ok(!genericErr.includes('Google API scope'), 'errorPage does not default to the scan-specific hint');
+const scanErr = errorPage('Boom', { title: 'Scan could not complete', hint: "Usually a Google API scope wasn't consented." });
+ok(scanErr.includes('Scan could not complete') && scanErr.includes('Google API scope'), 'errorPage still supports the scan-specific copy when explicitly requested');
+
 // ---- Role hint: MSP re-scanning must never fall through to client mode ----
 // (Regression: a Re-scan click without ?mode=msp defaults to mode=client on the
 // server, which both demotes the MSP's session AND routes them into the payment
@@ -323,6 +339,22 @@ ok((await store.getTenant(domain)).active === true, 'pg: re-scanning an active t
 await store.activateTenant(domain, { paymentCustomerId: 'CUS_test123' });
 ok((await store.getTenant(domain)).active === true, 'pg: activateTenant is idempotent');
 
+// subscription.create arriving later fills in the real code+token via COALESCE (webhook order isn't guaranteed)
+await store.activateTenant(domain, { paymentSubscriptionId: 'SUB_real789', paymentSubscriptionToken: 'tok_abc' });
+const t1b = await store.getTenant(domain);
+ok(t1b.paymentSubscriptionId === 'SUB_real789' && t1b.paymentSubscriptionToken === 'tok_abc', 'pg: subscription code+token captured from a later event');
+ok((await store.getTenantByPaymentCustomerId('CUS_test123')).domain === domain, 'pg: tenant look-up by payment customer id (subscription.create fallback path)');
+ok(await store.getTenantByPaymentCustomerId('CUS_does_not_exist') === null, 'pg: look-up by unknown customer id returns null');
+
+// ---- Cancellation ----
+await store.deactivateTenant(domain);
+const t2 = await store.getTenant(domain);
+ok(t2.active === false, 'pg: deactivateTenant marks the tenant inactive');
+ok(t2.paymentSubscriptionId === 'SUB_real789', 'pg: deactivateTenant keeps the subscription reference (Paystack cancellation is not instant)');
+// reactivate for the rest of the suite / org view assertions below
+await store.activateTenant(domain, {});
+ok((await store.getTenant(domain)).active === true, 'pg: re-activated after cancellation test');
+
 // ---- activate / activateSuccess page render ----
 const { activatePage, activateSuccessPage } = await import('./lib/render.js');
 const unpaidTenant = { domain: 'new-client.co.za', name: 'new-client.co.za', userCount: 60, priceCents: 10000, active: false };
@@ -338,6 +370,24 @@ const successHtml = activateSuccessPage({ domain: 'new-client.co.za', name: 'new
 ok(successHtml.includes("You're all set") && successHtml.includes('/tenant/new-client.co.za'), 'activate-success page links to the dashboard once activated');
 const processingHtml = activateSuccessPage({ domain: 'new-client.co.za' }, 'http://localhost:3000', false);
 ok(processingHtml.includes('processing'), 'activate-success page shows a processing state before activation lands');
+
+// MSP viewing an already-active tenant gets a deactivate override, not a payment form
+const activeTenant = { domain: 'active-client.co.za', name: 'active-client.co.za', userCount: 30, priceCents: 10000, active: true };
+const activeWallHtml = activatePage(activeTenant, 'http://localhost:3000', { isMsp: true });
+ok(activeWallHtml.includes('is active'), 'MSP sees active status, not a payment form, for an already-active tenant');
+ok(activeWallHtml.includes('action="http://localhost:3000/subscription/deactivate-manual"'), 'MSP gets a manual deactivate override');
+ok(!activeWallHtml.includes('action="http://localhost:3000/activate/checkout"'), 'MSP does not see a Paystack checkout form for an already-active tenant');
+// A client should never reach this branch (server redirects them to the dashboard first),
+// but the render function itself should still fail safe if ever called this way.
+const activeClientHtml = activatePage(activeTenant, 'http://localhost:3000', { isMsp: false });
+ok(!activeClientHtml.includes('subscription/deactivate-manual'), 'a non-MSP viewer never sees the deactivate override');
+
+// ---- Client dashboard: cancel-subscription form ----
+const dashClientHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'overview', { role: 'client' }, 'tok-abc');
+ok(dashClientHtml.includes('action="http://localhost:3000/subscription/cancel"'), 'client dashboard has a cancel-subscription form');
+ok(dashClientHtml.includes('name="_csrf" value="tok-abc"') , 'cancel-subscription form carries the CSRF token');
+const dashMspHtml = dashboardPage(scan, new Set(), 'http://localhost:3000', [], null, 'overview', { role: 'msp' });
+ok(!dashMspHtml.includes('subscription/cancel'), 'MSP dashboard does not show a cancel-subscription form (not their subscription)');
 
 // org view render
 const org = orgViewPage(await store.listTenants(), 'http://localhost:3000');

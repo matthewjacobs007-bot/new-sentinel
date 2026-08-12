@@ -61,8 +61,45 @@ const msal = () => new ConfidentialClientApplication({
 });
 
 const app = express();
+app.set('trust proxy', 1); // Render sits behind a reverse proxy — needed for accurate req.ip (rate limiting) and secure cookies
 app.use(express.urlencoded({ extended: false }));
-app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax' } }));
+app.use(session({
+  secret: SESSION_SECRET, resave: false, saveUninitialized: false,
+  cookie: { httpOnly: true, sameSite: 'lax', secure: BASE_URL.startsWith('https') },
+}));
+
+// ── CSRF protection ──────────────────────────────────────────
+// Session-bound synchronizer token. SameSite=Lax already blocks cookies on
+// cross-site subresource requests, but a crafted link is still a top-level GET
+// navigation that Lax allows — a real risk for state-changing GETs, and this is
+// defense-in-depth for the POST routes below regardless.
+const csrfToken = (req) => (req.session.csrfToken ??= crypto.randomBytes(20).toString('hex'));
+const requireCsrf = (req, res, next) => (
+  req.body._csrf && req.body._csrf === req.session.csrfToken
+    ? next()
+    : res.status(403).send(errorPage('Your session expired or this form was submitted from somewhere unexpected. Please go back and try again.'))
+);
+
+// ── Login rate limiting ──────────────────────────────────────
+// In-memory, per-IP. Resets on deploy/restart and doesn't share state across
+// multiple instances — acceptable for a single-instance deployment; a real
+// multi-instance setup would need this backed by Redis or similar.
+const loginAttempts = new Map(); // ip -> { count, resetAt }
+const LOGIN_MAX_ATTEMPTS = 8;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const tooManyLoginAttempts = (ip) => {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) return false;
+  return entry.count >= LOGIN_MAX_ATTEMPTS;
+};
+const recordFailedLogin = (ip) => {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  else entry.count += 1;
+};
+const clearLoginAttempts = (ip) => loginAttempts.delete(ip);
 
 // ── Auth helpers ────────────────────────────────────────────
 // A request is authenticated if the session has either an MSP team login OR a client role.
@@ -80,6 +117,13 @@ const requireMsp = (req, res, next) => (isMsp(req) ? next() : res.status(403).se
 const canSeeTenant = (req, domain) => isMsp(req) || (isClient(req) && req.session.tenant === domain);
 
 const wrap = (fn) => (req, res) => fn(req, res).catch((e) => res.status(500).send(errorPage(e.message)));
+// Same as wrap(), but with the scan-specific title/hint — only genuinely applies
+// to the two OAuth callback routes, where a thrown error really is usually a
+// missing scope or a non-admin account.
+const wrapScan = (fn) => (req, res) => fn(req, res).catch((e) => res.status(500).send(errorPage(e.message, {
+  title: 'Scan could not complete',
+  hint: "Usually a Google API scope wasn't consented, or the signed-in account isn't a super admin.",
+})));
 
 // A client's tenant must be paid & active before they see the dashboard. MSPs are
 // never gated — this is a client-only billing check, not an access-control one.
@@ -94,19 +138,23 @@ const requireActive = (req, res, next) => {
 app.get('/login', (req, res) => {
   if (isAuthed(req)) return res.redirect('/');
   const err = req.query.e === '1' ? 'Wrong username or password.'
+    : req.query.e === 'locked' ? 'Too many failed sign-in attempts. Please wait 15 minutes and try again.'
     : req.query.e === 'not_admin' ? 'That Google account is not a super admin of a Workspace domain. Ask your Workspace administrator to sign in instead.'
     : req.query.e === 'no_tenant' ? 'Your Workspace has not been onboarded to Sentinel yet. Please contact your MSP.'
     : '';
-  res.send(teamLoginPage(BASE_URL, err));
+  res.send(teamLoginPage(BASE_URL, err, csrfToken(req)));
 });
 
 // MSP team login — username + password from env vars.
-app.post('/login', (req, res) => {
+app.post('/login', requireCsrf, (req, res) => {
+  if (tooManyLoginAttempts(req.ip)) return res.redirect('/login?e=locked');
   if (req.body.user === TEAM_USER && req.body.pass === TEAM_PASS) {
+    clearLoginAttempts(req.ip);
     req.session.role = 'msp';
     req.session.user = req.body.user;
     return res.redirect('/');
   }
+  recordFailedLogin(req.ip);
   res.redirect('/login?e=1');
 });
 
@@ -116,7 +164,7 @@ app.get('/logout', (req, res) => req.session.destroy(() => res.redirect('/login'
 app.get('/', wrap(async (req, res) => {
   if (!isAuthed(req)) {
     // Anonymous visitor: the public lead-gen site, not a login redirect.
-    return res.send(marketingPage(BASE_URL, { sent: req.query.sent === '1' }));
+    return res.send(marketingPage(BASE_URL, { sent: req.query.sent === '1', csrfToken: csrfToken(req) }));
   }
   if (isMsp(req)) {
     // MSP: full org view.
@@ -127,7 +175,7 @@ app.get('/', wrap(async (req, res) => {
 }));
 
 // ── Contact / lead capture (public) ─────────────────────────
-app.post('/contact', wrap(async (req, res) => {
+app.post('/contact', requireCsrf, wrap(async (req, res) => {
   const { name, email, company, platform, message } = req.body;
   if (!name || !email) return res.redirect('/#contact');
   await store.saveLead({ name, email, company, platform, message });
@@ -150,7 +198,7 @@ app.get('/tenant/:domain', requireAuth, requireActive, wrap(async (req, res) => 
   const drift = diffScans(await store.previousScan(domain), { findings: saved.findings, score: saved.score });
   const category = String(req.query.cat || 'overview');
   // Clients can't access the "all tenants" back link — the renderer already reads a role hint.
-  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category, { role: isMsp(req) ? 'msp' : 'client' }));
+  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category, { role: isMsp(req) ? 'msp' : 'client' }, csrfToken(req)));
 }));
 
 app.get('/tenant/:domain/user/:email', requireAuth, requireActive, wrap(async (req, res) => {
@@ -162,7 +210,7 @@ app.get('/tenant/:domain/user/:email', requireAuth, requireActive, wrap(async (r
   const scan = { org: { name: t?.name || domain, platform: t?.platform || 'Google Workspace' }, scannedAt: saved.at, findings: saved.findings, stats: saved.stats || {}, details: saved.details || {} };
   const drift = diffScans(await store.previousScan(domain), { findings: saved.findings, score: saved.score });
   const category = 'user:' + encodeURIComponent(req.params.email);
-  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category, { role: isMsp(req) ? 'msp' : 'client' }));
+  res.send(dashboardPage(scan, await store.acceptedFor(domain), BASE_URL, await store.scanHistory(domain), drift, category, { role: isMsp(req) ? 'msp' : 'client' }, csrfToken(req)));
 }));
 
 // ── Client: link Workspace prompt (shown after first sign-in if no scan yet) ─
@@ -185,7 +233,7 @@ app.get('/auth/google', (req, res) => {
   res.redirect(oauth().generateAuthUrl({ access_type: 'online', prompt: 'consent', scope: SCOPES, state }));
 });
 
-app.get('/auth/google/callback', wrap(async (req, res) => {
+app.get('/auth/google/callback', wrapScan(async (req, res) => {
   if (!req.query.state || req.query.state !== req.session.oauth_state) throw new Error('State mismatch.');
   const mode = req.session.oauth_mode || 'client';
   const client = oauth();
@@ -250,7 +298,7 @@ app.get('/auth/microsoft', (req, res) => {
     .catch((e) => res.status(500).send(errorPage(e.message)));
 });
 
-app.get('/auth/microsoft/callback', wrap(async (req, res) => {
+app.get('/auth/microsoft/callback', wrapScan(async (req, res) => {
   if (!req.query.state || req.query.state !== req.session.oauth_state) throw new Error('State mismatch.');
   const mode = req.session.oauth_mode || 'client';
   const result = await msal().acquireTokenByCode({ code: req.query.code, scopes: MS_SCOPES, redirectUri: MS_REDIRECT_URI });
@@ -286,17 +334,19 @@ app.get('/auth/microsoft/callback', wrap(async (req, res) => {
 }));
 
 // ── Accept / un-accept risk (both roles can, but only on their own tenant) ──
-const back = (req, res) => res.redirect('/tenant/' + encodeURIComponent(req.query.tenant || ''));
-app.get('/accept', requireAuth, requireActive, wrap(async (req, res) => {
-  const domain = (req.query.tenant || '').toLowerCase();
+// POST + CSRF, not a plain GET link — this is a state change, and SameSite=Lax
+// cookies still ride along on a top-level GET navigation (e.g. a crafted link).
+const back = (req, res) => res.redirect('/tenant/' + encodeURIComponent(req.body.tenant || ''));
+app.post('/accept', requireAuth, requireActive, requireCsrf, wrap(async (req, res) => {
+  const domain = (req.body.tenant || '').toLowerCase();
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
-  if (req.query.id) await store.acceptRisk(domain, req.query.id);
+  if (req.body.id) await store.acceptRisk(domain, req.body.id);
   back(req, res);
 }));
-app.get('/unaccept', requireAuth, requireActive, wrap(async (req, res) => {
-  const domain = (req.query.tenant || '').toLowerCase();
+app.post('/unaccept', requireAuth, requireActive, requireCsrf, wrap(async (req, res) => {
+  const domain = (req.body.tenant || '').toLowerCase();
   if (!canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
-  if (req.query.id) await store.unacceptRisk(domain, req.query.id);
+  if (req.body.id) await store.unacceptRisk(domain, req.body.id);
   back(req, res);
 }));
 
@@ -313,10 +363,11 @@ app.get('/activate', requireAuth, wrap(async (req, res) => {
     cancelled: req.query.cancelled === '1',
     isMsp: isMsp(req),
     billingCurrency: process.env.PAYSTACK_CURRENCY || 'USD',
+    csrfToken: csrfToken(req),
   }));
 }));
 
-app.post('/activate/checkout', requireAuth, wrap(async (req, res) => {
+app.post('/activate/checkout', requireAuth, requireCsrf, wrap(async (req, res) => {
   const domain = (isMsp(req) ? req.body.domain : req.session.tenant || '').toLowerCase();
   if (!domain || !canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
   if (!billing.isConfigured()) return res.redirect('/activate?domain=' + encodeURIComponent(domain));
@@ -350,7 +401,7 @@ app.get('/activate/success', requireAuth, wrap(async (req, res) => {
 }));
 
 // MSP-only override — activate a tenant without a real charge (demos, manual invoicing).
-app.post('/activate/manual', requireMsp, wrap(async (req, res) => {
+app.post('/activate/manual', requireMsp, requireCsrf, wrap(async (req, res) => {
   const domain = (req.body.domain || '').toLowerCase();
   if (domain) await store.activateTenant(domain, {});
   res.redirect('/tenant/' + encodeURIComponent(domain));
@@ -372,8 +423,57 @@ app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), wrap(a
         paymentSubscriptionId: event.data.plan_object?.plan_code || event.data.plan,
       });
     }
+  } else if (event.event === 'subscription.create') {
+    // The real subscription_code + email_token (needed to ever cancel) only exist on
+    // this event, not on charge.success — and this event doesn't carry our metadata,
+    // so recover the domain from the plan name we set at creation ("Sentinel — <domain>"),
+    // falling back to matching the customer_code charge.success already stored.
+    const planName = event.data?.plan?.name || '';
+    const prefix = 'Sentinel — ';
+    let domain = planName.startsWith(prefix) ? planName.slice(prefix.length) : null;
+    if (!domain && event.data?.customer?.customer_code) {
+      domain = (await store.getTenantByPaymentCustomerId(event.data.customer.customer_code))?.domain || null;
+    }
+    if (domain) {
+      await store.activateTenant(domain, {
+        paymentCustomerId: event.data.customer?.customer_code,
+        paymentSubscriptionId: event.data.subscription_code,
+        paymentSubscriptionToken: event.data.email_token,
+      });
+    }
   }
   res.json({ received: true });
+}));
+
+// ── Cancel subscription ──────────────────────────────────────
+// Real cancellation needs the subscription_code + email_token from the
+// subscription.create webhook (see above) — without it we can't safely tell
+// Paystack to stop billing, so we say so rather than silently deactivating a
+// tenant whose subscription is still actually live and charging them.
+app.post('/subscription/cancel', requireAuth, requireCsrf, wrap(async (req, res) => {
+  const domain = (isMsp(req) ? req.body.domain : req.session.tenant || '').toLowerCase();
+  if (!domain || !canSeeTenant(req, domain)) return res.status(403).send(errorPage('You do not have access to this tenant.'));
+  const tenant = await store.getTenant(domain);
+  if (!tenant) return res.redirect('/');
+  if (!billing.isConfigured() || !tenant.paymentSubscriptionId || !tenant.paymentSubscriptionToken) {
+    return res.status(400).send(errorPage('We don’t have enough information yet to cancel this subscription automatically. Please contact us and we’ll cancel it for you.', { title: 'Cancellation unavailable' }));
+  }
+  try {
+    await billing.disableSubscription(tenant.paymentSubscriptionId, tenant.paymentSubscriptionToken);
+  } catch (e) {
+    return res.status(502).send(errorPage(`Paystack couldn't cancel this subscription (${e.message}). Please contact us and we'll sort it out.`, { title: 'Cancellation failed' }));
+  }
+  await store.deactivateTenant(domain);
+  res.redirect(isMsp(req) ? '/' : '/activate');
+}));
+
+// MSP-only override — deactivate a tenant without touching Paystack (the client
+// arranged cancellation directly with the MSP outside the app, a comped account
+// is ending, etc.). Mirrors /activate/manual's override for the opposite direction.
+app.post('/subscription/deactivate-manual', requireMsp, requireCsrf, wrap(async (req, res) => {
+  const domain = (req.body.domain || '').toLowerCase();
+  if (domain) await store.deactivateTenant(domain);
+  res.redirect('/');
 }));
 
 // ── CSV export ──────────────────────────────────────────────
